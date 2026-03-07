@@ -1,6 +1,7 @@
 # app/google_places.py
 
 import re
+import json
 import urllib.parse
 import httpx
 from playwright.async_api import async_playwright
@@ -52,8 +53,17 @@ async def search_restaurants(query: str) -> list[dict]:
 
 async def extract_swiggy_link(place_id: str, restaurant_name: str = "", address: str = "") -> dict:
     """
-    Find Swiggy URL using DuckDuckGo HTML search inside Playwright.
-    Uses html.duckduckgo.com (no JavaScript needed, instant results).
+    Find Swiggy restaurant ID using Swiggy's OWN search API.
+
+    Instead of fighting search engines (all blocked on cloud IPs), we:
+    1. Open Swiggy.com in browser (get WAF token + cookies)
+    2. Call Swiggy's internal search API with restaurant name + lat/lng from Google
+    3. Match the result to find the correct restaurant ID
+
+    This is the most reliable approach because:
+    - We use Swiggy's own data (not a third-party search engine)
+    - Google Places lat/lng ensures we search in the right city
+    - No search engine captchas or blocks
     """
     print(f"\n🔍 Finding Swiggy link for: {restaurant_name}")
 
@@ -66,20 +76,19 @@ async def extract_swiggy_link(place_id: str, restaurant_name: str = "", address:
     city = _extract_city(address)
     print(f"   City from address: {city}")
 
-    # Build name variants
+    # Get lat/lng from address parsing (will be overridden by caller if available)
     short_name = _get_short_name(restaurant_name)
     print(f"   Full name: {restaurant_name}")
     print(f"   Short name: {short_name}")
 
-    # Build search queries
-    search_queries = []
-    if city:
-        search_queries.append(f"{short_name} {city} swiggy.com")
-        search_queries.append(f"{short_name} {city} swiggy")
-        if short_name != restaurant_name:
-            search_queries.append(f"{restaurant_name} {city} swiggy.com")
-    search_queries.append(f"{short_name} swiggy.com")
-    search_queries.append(f"{short_name} swiggy menu order")
+    # Build search terms to try on Swiggy
+    search_terms = [short_name]
+    if short_name != restaurant_name:
+        search_terms.append(restaurant_name)
+    # Also try first word only (e.g., "Brewgarten" from "Brewgarten Ahmedabad")
+    first_word = short_name.split()[0] if short_name else ""
+    if first_word and len(first_word) >= 4 and first_word.lower() != short_name.lower():
+        search_terms.append(first_word)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -102,167 +111,376 @@ async def extract_swiggy_link(place_id: str, restaurant_name: str = "", address:
 
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         """)
 
         page = await context.new_page()
 
         try:
-            for query in search_queries:
-                print(f"\n🔎 DuckDuckGo HTML: {query}")
+            # ── Step 1: Open Swiggy to get WAF token ──
+            print("📍 Loading Swiggy for search API access...")
+            await page.goto("https://www.swiggy.com", timeout=30000)
+            await page.wait_for_timeout(4000)
 
-                # Use the HTML-only version of DuckDuckGo (no JS rendering needed)
-                ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+            cookies = await context.cookies()
+            has_waf = "aws-waf-token" in [c["name"] for c in cookies]
+            print(f"🍪 WAF token: {has_waf}")
 
-                try:
-                    await page.goto(ddg_url, timeout=15000, wait_until="domcontentloaded")
-                    await page.wait_for_timeout(1500)
-                except Exception as e:
-                    print(f"   ⚠️ Navigation error: {e}")
+            # ── Step 2: Call Swiggy search API from the browser ──
+            for term in search_terms:
+                print(f"\n🔎 Swiggy API search: '{term}'")
 
-                    # Fallback: try regular DuckDuckGo
-                    try:
-                        ddg_url2 = f"https://duckduckgo.com/?q={urllib.parse.quote(query)}&t=h_&ia=web"
-                        await page.goto(ddg_url2, timeout=15000)
-                        await page.wait_for_timeout(3000)
-                    except:
-                        continue
-
-                # Get the full page HTML
-                html = await page.content()
-
-                # Debug: show page title and length
-                title = await page.title()
-                print(f"   Page: '{title[:50]}' ({len(html)} chars)")
-
-                # ── Method 1: Find Swiggy URLs directly in HTML ──
-                swiggy_patterns = [
-                    r'https?://(?:www\.)?swiggy\.com/city/[^\s"\'<>&;]+rest\d+',
-                    r'https?://(?:www\.)?swiggy\.com/[^\s"\'<>&;]*rest\d+',
-                    r'swiggy\.com/city/[^\s"\'<>&;]+rest\d+',
-                ]
-
-                for pattern in swiggy_patterns:
-                    matches = re.findall(pattern, html)
-                    if matches:
-                        url = matches[0]
-                        if not url.startswith("http"):
-                            url = "https://www." + url
-                        result["swiggy_url"] = urllib.parse.unquote(url)
-                        print(f"✅ Found Swiggy in HTML: {result['swiggy_url'][:100]}")
-                        break
-
-                if result["swiggy_url"]:
-                    break
-
-                # ── Method 2: Find encoded Swiggy URLs (DDG uddg redirect) ──
-                uddg_matches = re.findall(r'uddg=([^&"\'<>\s]+)', html)
-                for encoded_url in uddg_matches:
-                    decoded = urllib.parse.unquote(encoded_url)
-                    if "swiggy.com" in decoded and "rest" in decoded:
-                        result["swiggy_url"] = decoded
-                        print(f"✅ Found Swiggy (DDG uddg): {decoded[:100]}")
-                        break
-
-                if result["swiggy_url"]:
-                    break
-
-                # ── Method 3: Check all <a> href attributes ──
-                links = await page.eval_on_selector_all(
-                    "a[href]",
-                    "els => els.map(e => ({href: e.href, text: (e.textContent || '').substring(0, 80)}))",
+                search_result = await page.evaluate(
+                    """async (params) => {
+                        try {
+                            const url = `https://www.swiggy.com/dapi/restaurants/search/v3?lat=${params.lat}&lng=${params.lng}&str=${encodeURIComponent(params.query)}&trackingId=undefined&submitAction=ENTER&queryUniqueId=`;
+                            const response = await fetch(url, {
+                                method: 'GET',
+                                credentials: 'include',
+                                headers: {
+                                    'Accept': 'application/json, text/plain, */*',
+                                    'Content-Type': 'application/json',
+                                }
+                            });
+                            const data = await response.json();
+                            return { status: response.status, data: JSON.stringify(data) };
+                        } catch(e) {
+                            return { status: 0, data: e.message };
+                        }
+                    }""",
+                    {
+                        "query": term,
+                        "lat": str(result.get("_lat", "19.0760")),
+                        "lng": str(result.get("_lng", "72.8777")),
+                    },
                 )
 
-                # Debug: show results found
-                result_links = [l for l in links if "swiggy" in l.get("href", "").lower() or "swiggy" in l.get("text", "").lower()]
-                if result_links:
-                    print(f"   🔗 Swiggy-related links found: {len(result_links)}")
-                    for rl in result_links[:5]:
-                        print(f"      → {rl['href'][:80]} [{rl['text'][:30]}]")
+                if search_result["status"] != 200:
+                    print(f"   ⚠️ Swiggy API returned status: {search_result['status']}")
+                    continue
 
-                for link in links:
-                    href = link.get("href", "")
+                try:
+                    api_data = json.loads(search_result["data"])
+                except:
+                    print(f"   ⚠️ Invalid JSON from Swiggy API")
+                    continue
 
-                    # Direct Swiggy link
-                    if "swiggy.com" in href and "rest" in href:
-                        result["swiggy_url"] = _clean_redirect(href)
-                        print(f"✅ Found Swiggy (link): {result['swiggy_url'][:100]}")
-                        break
+                # Parse search results to find restaurant cards
+                restaurants = _extract_restaurants_from_search(api_data)
+                print(f"   📋 Found {len(restaurants)} restaurants in Swiggy search")
 
-                    # DDG redirect containing Swiggy
-                    if "duckduckgo.com" in href and "swiggy" in href:
-                        cleaned = _clean_redirect(href)
-                        if "swiggy.com" in cleaned and "rest" in cleaned:
-                            result["swiggy_url"] = cleaned
-                            print(f"✅ Found Swiggy (DDG redirect link): {cleaned[:100]}")
-                            break
+                if not restaurants:
+                    continue
 
-                if result["swiggy_url"]:
+                # Print all results for debugging
+                for r in restaurants[:5]:
+                    print(f"      → {r['name']} (ID: {r['id']}, Area: {r.get('area', 'N/A')})")
+
+                # Try to match by name
+                matched = _match_restaurant(restaurants, restaurant_name, short_name, city)
+
+                if matched:
+                    result["restaurant_id"] = str(matched["id"])
+                    # Build Swiggy URL from the slug if available
+                    slug = matched.get("slug", "")
+                    city_slug = matched.get("city_slug", "")
+                    if slug and city_slug:
+                        result["swiggy_url"] = f"https://www.swiggy.com/city/{city_slug}/{slug}"
+                    else:
+                        result["swiggy_url"] = f"https://www.swiggy.com/restaurant/rest{matched['id']}"
+                    print(f"✅ Matched: {matched['name']} (ID: {matched['id']})")
+                    print(f"🔗 Swiggy URL: {result['swiggy_url']}")
                     break
 
-                # Debug: show what links we DID find
-                external = [l for l in links if l.get("href", "").startswith("http")
-                           and "duckduckgo" not in l.get("href", "")]
-                if external and not result_links:
-                    print(f"   ℹ️ Non-DDG links found: {len(external)}")
-                    for el in external[:3]:
-                        print(f"      → {el['href'][:80]}")
-
-            # ── Fallback: try Bing ──
-            if not result["swiggy_url"]:
-                bing_queries = []
-                if city:
-                    bing_queries.append(f"{short_name} {city} site:swiggy.com")
-                bing_queries.append(f"{short_name} swiggy site:swiggy.com")
-
-                for query in bing_queries:
-                    print(f"\n🔎 Bing: {query}")
-
-                    try:
-                        bing_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
-                        await page.goto(bing_url, timeout=15000)
-                        await page.wait_for_timeout(2000)
-
-                        html = await page.content()
-
-                        for pattern in swiggy_patterns:
-                            matches = re.findall(pattern, html)
-                            if matches:
-                                url = matches[0]
-                                if not url.startswith("http"):
-                                    url = "https://www." + url
-                                result["swiggy_url"] = urllib.parse.unquote(url)
-                                print(f"✅ Found Swiggy (Bing): {result['swiggy_url'][:100]}")
-                                break
-
-                        if result["swiggy_url"]:
-                            break
-
-                    except Exception as e:
-                        print(f"   ⚠️ Bing error: {e}")
-
         except Exception as e:
-            print(f"❌ Search error: {e}")
+            print(f"❌ Error: {e}")
 
         await browser.close()
 
-    # Extract restaurant ID
-    if result["swiggy_url"]:
-        # Clean up URL (remove tracking params)
-        clean_url = result["swiggy_url"].split("?")[0] if "utm_" in result["swiggy_url"] else result["swiggy_url"]
-        result["swiggy_url"] = clean_url
-
+    # Extract restaurant ID from URL if not set
+    if result["swiggy_url"] and not result["restaurant_id"]:
         match = re.search(r"rest(\d+)", result["swiggy_url"])
         if match:
             result["restaurant_id"] = match.group(1)
-            print(f"🆔 Restaurant ID: {result['restaurant_id']}")
+
+    if result["restaurant_id"]:
+        print(f"🆔 Restaurant ID: {result['restaurant_id']}")
     else:
-        print("⚠️ No Swiggy link found via any search engine")
+        print("⚠️ No matching restaurant found on Swiggy")
 
     return result
 
 
+async def extract_swiggy_link_with_coords(
+    place_id: str,
+    restaurant_name: str,
+    address: str,
+    lat: str,
+    lng: str,
+) -> dict:
+    """
+    Same as extract_swiggy_link but accepts lat/lng directly.
+    This is what routes.py should call.
+    """
+    print(f"\n🔍 Finding Swiggy link for: {restaurant_name}")
+
+    result_data = {
+        "swiggy_url": None,
+        "restaurant_id": None,
+        "zomato_url": None,
+    }
+
+    city = _extract_city(address)
+    short_name = _get_short_name(restaurant_name)
+
+    print(f"   City: {city}")
+    print(f"   Full name: {restaurant_name}")
+    print(f"   Short name: {short_name}")
+    print(f"   Coords: {lat}, {lng}")
+
+    # Build search terms
+    search_terms = [short_name]
+    if short_name != restaurant_name:
+        search_terms.append(restaurant_name)
+    first_word = short_name.split()[0] if short_name else ""
+    if first_word and len(first_word) >= 4 and first_word.lower() != short_name.lower():
+        search_terms.append(first_word)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+        """)
+
+        page = await context.new_page()
+
+        try:
+            # ── Step 1: Open Swiggy to get WAF token ──
+            print("📍 Loading Swiggy for search API access...")
+            await page.goto("https://www.swiggy.com", timeout=30000)
+            await page.wait_for_timeout(4000)
+
+            # Set location cookie with Google Places lat/lng
+            await context.add_cookies([
+                {
+                    "name": "userLocation",
+                    "value": json.dumps({
+                        "lat": lat, "lng": lng,
+                        "address": address or city,
+                        "id": "", "annotation": city or "India",
+                    }),
+                    "domain": ".swiggy.com",
+                    "path": "/",
+                }
+            ])
+
+            cookies = await context.cookies()
+            has_waf = "aws-waf-token" in [c["name"] for c in cookies]
+            print(f"🍪 WAF token: {has_waf}")
+
+            # ── Step 2: Call Swiggy search API ──
+            for term in search_terms:
+                print(f"\n🔎 Swiggy API search: '{term}' (lat={lat}, lng={lng})")
+
+                search_result = await page.evaluate(
+                    """async (params) => {
+                        try {
+                            const url = `https://www.swiggy.com/dapi/restaurants/search/v3?lat=${params.lat}&lng=${params.lng}&str=${encodeURIComponent(params.query)}&trackingId=undefined&submitAction=ENTER&queryUniqueId=`;
+                            const response = await fetch(url, {
+                                method: 'GET',
+                                credentials: 'include',
+                                headers: {
+                                    'Accept': 'application/json, text/plain, */*',
+                                    'Content-Type': 'application/json',
+                                }
+                            });
+                            const text = await response.text();
+                            return { status: response.status, data: text };
+                        } catch(e) {
+                            return { status: 0, data: e.message };
+                        }
+                    }""",
+                    {"query": term, "lat": lat, "lng": lng},
+                )
+
+                if search_result["status"] != 200:
+                    print(f"   ⚠️ Swiggy API status: {search_result['status']}")
+                    continue
+
+                try:
+                    api_data = json.loads(search_result["data"])
+                except:
+                    print(f"   ⚠️ Invalid JSON from Swiggy")
+                    continue
+
+                # Parse results
+                restaurants = _extract_restaurants_from_search(api_data)
+                print(f"   📋 Found {len(restaurants)} restaurants")
+
+                if not restaurants:
+                    continue
+
+                for r in restaurants[:5]:
+                    print(f"      → {r['name']} (ID: {r['id']}, Area: {r.get('area', 'N/A')})")
+
+                # Match
+                matched = _match_restaurant(restaurants, restaurant_name, short_name, city)
+
+                if matched:
+                    result_data["restaurant_id"] = str(matched["id"])
+                    slug = matched.get("slug", "")
+                    city_slug = matched.get("city_slug", "")
+                    if slug and city_slug:
+                        result_data["swiggy_url"] = f"https://www.swiggy.com/city/{city_slug}/{slug}"
+                    else:
+                        result_data["swiggy_url"] = f"https://www.swiggy.com/restaurant/rest{matched['id']}"
+                    print(f"✅ Matched: {matched['name']} (ID: {matched['id']})")
+                    print(f"🔗 URL: {result_data['swiggy_url']}")
+                    break
+
+        except Exception as e:
+            print(f"❌ Error: {e}")
+
+        await browser.close()
+
+    if result_data["restaurant_id"]:
+        print(f"🆔 Restaurant ID: {result_data['restaurant_id']}")
+    else:
+        print("⚠️ No matching restaurant found on Swiggy")
+
+    return result_data
+
+
+def _extract_restaurants_from_search(api_data: dict) -> list[dict]:
+    """Parse Swiggy search API response to extract restaurant info."""
+    restaurants = []
+
+    # Swiggy search returns data in cards
+    cards = api_data.get("data", {}).get("cards", [])
+
+    for card in cards:
+        # Try different card structures
+        group_cards = card.get("groupedCard", {}).get("cardGroupMap", {})
+
+        # Check RESTAURANT group
+        rest_group = group_cards.get("RESTAURANT", {})
+        if rest_group:
+            for rc in rest_group.get("cards", []):
+                info = rc.get("card", {}).get("card", {}).get("info", {})
+                if info.get("id"):
+                    restaurants.append(_parse_restaurant_info(info))
+
+        # Also check top-level cards
+        inner = card.get("card", {}).get("card", {})
+        if inner.get("@type", "").endswith("RestaurantSearchResult"):
+            info = inner.get("info", {})
+            if info.get("id"):
+                restaurants.append(_parse_restaurant_info(info))
+
+        # Check for restaurant list in card
+        if "restaurants" in inner:
+            for rest in inner["restaurants"]:
+                info = rest.get("info", {})
+                if info.get("id"):
+                    restaurants.append(_parse_restaurant_info(info))
+
+    # Deduplicate by ID
+    seen = set()
+    unique = []
+    for r in restaurants:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            unique.append(r)
+
+    return unique
+
+
+def _parse_restaurant_info(info: dict) -> dict:
+    """Parse a single restaurant info dict from Swiggy API."""
+    return {
+        "id": info.get("id", ""),
+        "name": info.get("name", ""),
+        "area": info.get("areaName", ""),
+        "city_slug": info.get("city", {}).get("slug", "") if isinstance(info.get("city"), dict) else "",
+        "slug": info.get("slugs", {}).get("restaurant", "") if isinstance(info.get("slugs"), dict) else "",
+        "cuisines": info.get("cuisines", []),
+        "rating": info.get("avgRating", ""),
+        "cost_for_two": info.get("costForTwoMessage", ""),
+    }
+
+
+def _match_restaurant(restaurants: list[dict], full_name: str, short_name: str, city: str) -> dict | None:
+    """
+    Match a restaurant from Swiggy search results to the Google Places name.
+    Uses fuzzy matching since names differ across platforms.
+    """
+    full_lower = full_name.lower().strip()
+    short_lower = short_name.lower().strip()
+
+    # Extract significant words from short name
+    skip_words = {"the", "and", "of", "by", "at", "in", "a", "an"}
+    short_words = [w for w in short_lower.split() if w not in skip_words and len(w) >= 3]
+
+    # Pass 1: Exact name match
+    for r in restaurants:
+        r_name = r["name"].lower().strip()
+        if r_name == full_lower or r_name == short_lower:
+            return r
+
+    # Pass 2: One name contains the other
+    for r in restaurants:
+        r_name = r["name"].lower().strip()
+        if short_lower in r_name or r_name in short_lower:
+            return r
+        if full_lower in r_name or r_name in full_lower:
+            return r
+
+    # Pass 3: Majority of significant words match
+    if short_words:
+        best_match = None
+        best_score = 0
+
+        for r in restaurants:
+            r_name = r["name"].lower()
+            matched = sum(1 for w in short_words if w in r_name)
+            score = matched / len(short_words)
+            if score > best_score and score >= 0.5:
+                best_score = score
+                best_match = r
+
+        if best_match:
+            return best_match
+
+    # Pass 4: If only 1 result, take it (Swiggy search was specific enough)
+    if len(restaurants) == 1:
+        print(f"   ℹ️ Only 1 result, auto-matching: {restaurants[0]['name']}")
+        return restaurants[0]
+
+    return None
+
+
 def _get_short_name(name: str) -> str:
-    """Remove common restaurant suffixes to get the core name."""
+    """Remove common restaurant suffixes."""
     short = name
     suffixes = [
         " - Kitchen & Bar", " - Kitchen and Bar", " - Bar & Kitchen",
@@ -305,18 +523,3 @@ def _extract_city(address: str) -> str:
         return cleaned[0]
 
     return ""
-
-
-def _clean_redirect(url: str) -> str:
-    """Extract actual URL from search engine redirect wrappers."""
-    # DuckDuckGo redirect
-    if "duckduckgo.com/l/" in url:
-        match = re.search(r'uddg=(https?[^&]+)', url)
-        if match:
-            return urllib.parse.unquote(match.group(1))
-    # Google redirect
-    if "google.com/url" in url:
-        match = re.search(r'[?&]q=(https?[^&]+)', url)
-        if match:
-            return urllib.parse.unquote(match.group(1))
-    return url

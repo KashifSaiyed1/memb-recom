@@ -7,7 +7,7 @@ from app.models import (
     GmapsScrapeRequest,
 )
 from app.service import process_restaurant, process_restaurant_by_id
-from app.google_places import search_restaurants, extract_swiggy_link
+from app.google_places import search_restaurants, extract_swiggy_link_with_coords
 from app.cities import get_city_coordinates, get_all_cities
 from app import DEFAULT_LAT, DEFAULT_LNG, DEFAULT_CITY
 
@@ -61,17 +61,19 @@ async def scrape_via_gmaps(request: GmapsScrapeRequest):
 
     Pass the name and lat/lng from the /suggest response.
     """
-    lat = str(request.lat) if request.lat else DEFAULT_LAT
-    lng = str(request.lng) if request.lng else DEFAULT_LNG
+    lat = request.lat or DEFAULT_LAT
+    lng = request.lng or DEFAULT_LNG
     city_label = "Google Maps location"
 
     try:
-        # ── Strategy 1: Try to get Swiggy link from Google Maps ──
-        print(f"\n🗺️ Strategy 1: Finding Swiggy link via Google Search...")
-        link_result = await extract_swiggy_link(
+        # ── Strategy 1: Find restaurant on Swiggy using its own search API ──
+        print(f"\n🗺️ Strategy 1: Searching Swiggy API with Google Places name + coords...")
+        link_result = await extract_swiggy_link_with_coords(
             place_id=request.place_id,
             restaurant_name=request.name,
             address=request.address,
+            lat=lat,
+            lng=lng,
         )
 
         swiggy_url = link_result.get("swiggy_url")
