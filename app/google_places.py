@@ -85,7 +85,7 @@ async def extract_swiggy_link(place_id: str, restaurant_name: str = "", address:
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
