@@ -3,7 +3,7 @@
 import json
 import pandas as pd
 
-from app.scraper import fetch_menu
+from app.scraper import fetch_menu, fetch_menu_by_id
 from app.extractor import extract_restaurant_info
 from app.parser import parse_menu
 from app.inference import infer_restaurant_attributes
@@ -19,14 +19,7 @@ async def process_restaurant(
     save_json: bool = True,
 ) -> dict:
     """
-    End-to-end pipeline:
-      1. Scrape menu JSON from Swiggy
-      2. Extract restaurant metadata
-      3. Parse menu items
-      4. Infer business attributes
-      5. Save CSV + JSON
-
-    Returns a dict with: restaurant_info, inferred, menu_df, summary
+    OLD FLOW: Search Swiggy by name → parse → infer.
     """
     # ── Step 1: Scrape ──
     menu_json = await fetch_menu(restaurant_name, lat=lat, lng=lng, city_label=city_label)
@@ -35,20 +28,63 @@ async def process_restaurant(
         print("❌ Menu not captured.")
         return {"error": "Menu not captured"}
 
-    # ── Step 2: Parse menu items ──
+    return await _process_menu_json(menu_json, restaurant_name, save_csv, save_json)
+
+
+async def process_restaurant_by_id(
+    restaurant_id: str,
+    lat: str = DEFAULT_LAT,
+    lng: str = DEFAULT_LNG,
+    city_label: str = DEFAULT_CITY,
+    swiggy_url: str = None,
+    save_csv: bool = False,
+    save_json: bool = False,
+) -> dict:
+    """
+    NEW FLOW: Fetch menu directly by Swiggy restaurant ID (skips search).
+    """
+    # ── Step 1: Scrape by ID ──
+    menu_json = await fetch_menu_by_id(
+        restaurant_id=restaurant_id,
+        lat=lat,
+        lng=lng,
+        city_label=city_label,
+        swiggy_url=swiggy_url,
+    )
+
+    if not menu_json:
+        print("❌ Menu not captured.")
+        return {"error": "Menu not captured"}
+
+    return await _process_menu_json(menu_json, f"rest{restaurant_id}", save_csv, save_json)
+
+
+async def _process_menu_json(
+    menu_json: dict,
+    label: str,
+    save_csv: bool,
+    save_json: bool,
+) -> dict:
+    """
+    Shared processing: parse menu items → extract metadata → infer attributes.
+    Used by both old and new flow.
+    """
+    # ── Step 2: Extract restaurant metadata ──
+    restaurant_info = extract_restaurant_info(menu_json)
+    _print_restaurant_info(restaurant_info)
+
+    # ── Step 3: Parse menu items ──
     menu_items = parse_menu(menu_json)
 
     if not menu_items:
-        # Save raw JSON for debugging
-        debug_path = f"{_safe_filename(restaurant_name)}_debug.json"
-        with open(debug_path, "w") as f:
-            json.dump(menu_json, f, indent=2)
-        print(f"❌ No items found. Raw JSON saved as {debug_path}")
-        return {"error": "No menu items found", "debug_file": debug_path}
-
-    # ── Step 3: Extract restaurant metadata ──
-    restaurant_info = extract_restaurant_info(menu_json)
-    _print_restaurant_info(restaurant_info)
+        debug_path = f"{_safe_filename(label)}_debug.json"
+        try:
+            with open(debug_path, "w") as f:
+                json.dump(menu_json, f, indent=2)
+            print(f"❌ No items found. Raw JSON saved as {debug_path}")
+        except:
+            pass
+        return {"error": "No menu items found"}
 
     # ── Step 4: Infer business attributes ──
     inferred = infer_restaurant_attributes(restaurant_info, menu_items)
@@ -60,7 +96,7 @@ async def process_restaurant(
 
     # ── Step 6: Build summary ──
     summary = {
-        "Restaurant Name": restaurant_info.get("name", restaurant_name),
+        "Restaurant Name": restaurant_info.get("name", label),
         "Cuisines (Swiggy)": ", ".join(restaurant_info.get("cuisines", [])),
         "Cost for Two (Swiggy)": restaurant_info.get("costForTwoMessage", ""),
         "Rating": restaurant_info.get("avgRating", ""),
@@ -73,7 +109,7 @@ async def process_restaurant(
     _print_summary(summary)
 
     # ── Step 7: Save files ──
-    base_name = _safe_filename(restaurant_name)
+    base_name = _safe_filename(label)
 
     if save_csv:
         csv_path = f"{base_name}_menu.csv"

@@ -2,6 +2,5 @@ playwright==1.49.1
 pandas==2.2.3
 fastapi
 uvicorn
-playwright
-pandas
-# ... any other existing requirements ...
+httpx
+pydantic
