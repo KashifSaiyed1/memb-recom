@@ -52,13 +52,10 @@ async def search_restaurants(query: str) -> list[dict]:
 
 async def extract_swiggy_link(place_id: str, restaurant_name: str = "", address: str = "") -> dict:
     """
-    Find Swiggy URL for a restaurant.
+    Find Swiggy URL for a restaurant using DuckDuckGo search inside Playwright.
 
-    Strategy 1a: DuckDuckGo HTML search (no browser, no captcha, fast)
-    Strategy 1b: DuckDuckGo with shorter name
-    Strategy 1c: Direct Swiggy search API via browser
-
-    Returns dict with swiggy_url, restaurant_id, zomato_url.
+    httpx requests to search engines are blocked on Render's network,
+    so we use a real browser to search DuckDuckGo instead.
     """
     print(f"\n🔍 Finding Swiggy link for: {restaurant_name}")
 
@@ -71,14 +68,15 @@ async def extract_swiggy_link(place_id: str, restaurant_name: str = "", address:
     city = _extract_city(address)
     print(f"   City from address: {city}")
 
-    # Build name variants to search
+    # Build name variants
     clean_name = restaurant_name.replace(" - ", " ").replace(" & ", " and ")
 
     # Short name: remove common suffixes
     short_name = restaurant_name
     for suffix in [" - Kitchen & Bar", " - Kitchen and Bar", " - Bar & Kitchen",
                    " - Restaurant & Bar", " - Restaurant", " - Cafe", " - Bar",
-                   " Restaurant", " Cafe", " Bar", " Kitchen"]:
+                   " Restaurant", " Cafe", " Bar", " Kitchen", " Lounge",
+                   " - Lounge", " - Bistro", " Bistro"]:
         if short_name.lower().endswith(suffix.lower()):
             short_name = short_name[:len(short_name) - len(suffix)].strip()
             break
@@ -86,41 +84,86 @@ async def extract_swiggy_link(place_id: str, restaurant_name: str = "", address:
     print(f"   Full name: {restaurant_name}")
     print(f"   Short name: {short_name}")
 
-    # ── Strategy 1a: DuckDuckGo search (no browser needed!) ──
+    # Build search queries (most specific first)
     search_queries = []
     if city:
-        search_queries.append(f"{clean_name} {city} site:swiggy.com")
         search_queries.append(f"{short_name} {city} site:swiggy.com")
+        search_queries.append(f"{clean_name} {city} site:swiggy.com")
         search_queries.append(f"{short_name} {city} swiggy")
-    search_queries.append(f"{clean_name} site:swiggy.com")
-    search_queries.append(f"{short_name} swiggy")
+    search_queries.append(f"{short_name} site:swiggy.com")
+    search_queries.append(f"{short_name} swiggy menu")
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for query in search_queries:
-            print(f"\n🔎 DuckDuckGo: {query}")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
 
-            try:
-                ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-                response = await client.get(
-                    ddg_url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-                    },
-                    follow_redirects=True,
-                )
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        """)
 
-                if response.status_code != 200:
-                    print(f"   ⚠️ DuckDuckGo returned {response.status_code}")
+        page = await context.new_page()
+
+        try:
+            for query in search_queries:
+                print(f"\n🔎 DuckDuckGo: {query}")
+
+                ddg_url = f"https://duckduckgo.com/?q={urllib.parse.quote(query)}"
+                try:
+                    await page.goto(ddg_url, timeout=15000)
+                    await page.wait_for_timeout(2000)
+                except Exception as e:
+                    print(f"   ⚠️ Navigation error: {e}")
                     continue
 
-                html = response.text
+                # Get all links from the page
+                links = await page.eval_on_selector_all(
+                    "a[href]",
+                    "els => els.map(e => e.href)",
+                )
 
-                # Find Swiggy URLs in DuckDuckGo results
-                # DDG wraps links in redirects: //duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.swiggy.com%2F...
+                # Check for Swiggy URLs
+                for href in links:
+                    if "swiggy.com" in href and "rest" in href:
+                        clean = _clean_redirect(href)
+                        if "rest" in clean:
+                            result["swiggy_url"] = clean
+                            print(f"✅ Found Swiggy link: {clean[:100]}")
+                            break
+
+                if result["swiggy_url"]:
+                    break
+
+                # Also check page HTML for encoded URLs
+                html = await page.content()
+                swiggy_matches = re.findall(
+                    r'https?://(?:www\.)?swiggy\.com/city/[^\s"\'<>&]+rest\d+[^\s"\'<>&]*',
+                    html,
+                )
+                if swiggy_matches:
+                    result["swiggy_url"] = urllib.parse.unquote(swiggy_matches[0])
+                    print(f"✅ Found Swiggy in HTML: {result['swiggy_url'][:100]}")
+                    break
+
+                # Check DuckDuckGo redirect URLs (uddg parameter)
                 uddg_matches = re.findall(r'uddg=(https?[^&"]+swiggy\.com[^&"]*)', html)
                 for match in uddg_matches:
                     decoded = urllib.parse.unquote(match)
-                    if "rest" in decoded and "/city/" in decoded:
+                    if "rest" in decoded:
                         result["swiggy_url"] = decoded
                         print(f"✅ Found Swiggy (DDG redirect): {decoded[:100]}")
                         break
@@ -128,53 +171,22 @@ async def extract_swiggy_link(place_id: str, restaurant_name: str = "", address:
                 if result["swiggy_url"]:
                     break
 
-                # Also check for direct swiggy.com URLs in the HTML
-                direct_matches = re.findall(
-                    r'https?://(?:www\.)?swiggy\.com/city/[^\s"\'<>&]+rest\d+[^\s"\'<>&]*',
-                    html,
-                )
-                if direct_matches:
-                    result["swiggy_url"] = urllib.parse.unquote(direct_matches[0])
-                    print(f"✅ Found Swiggy (DDG direct): {result['swiggy_url'][:100]}")
-                    break
+            # ── If DDG failed, try Bing in the same browser ──
+            if not result["swiggy_url"]:
+                bing_queries = []
+                if city:
+                    bing_queries.append(f"{short_name} {city} site:swiggy.com")
+                bing_queries.append(f"{short_name} swiggy site:swiggy.com")
 
-                # Check for any swiggy.com link
-                any_swiggy = re.findall(
-                    r'https?://(?:www\.)?swiggy\.com/[^\s"\'<>&]+rest\d+',
-                    html,
-                )
-                if any_swiggy:
-                    result["swiggy_url"] = urllib.parse.unquote(any_swiggy[0])
-                    print(f"✅ Found Swiggy (DDG any): {result['swiggy_url'][:100]}")
-                    break
+                for query in bing_queries:
+                    print(f"\n🔎 Bing: {query}")
 
-            except Exception as e:
-                print(f"   ⚠️ DuckDuckGo error: {e}")
-                continue
+                    try:
+                        bing_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
+                        await page.goto(bing_url, timeout=15000)
+                        await page.wait_for_timeout(2000)
 
-    # ── Strategy 1b: Try Bing search if DDG failed ──
-    if not result["swiggy_url"]:
-        print("\n🔎 Trying Bing search...")
-
-        bing_queries = []
-        if city:
-            bing_queries.append(f"{short_name} {city} site:swiggy.com")
-        bing_queries.append(f"{short_name} swiggy site:swiggy.com")
-
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            for query in bing_queries:
-                try:
-                    bing_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
-                    response = await client.get(
-                        bing_url,
-                        headers={
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-                        },
-                        follow_redirects=True,
-                    )
-
-                    if response.status_code == 200:
-                        html = response.text
+                        html = await page.content()
                         swiggy_matches = re.findall(
                             r'https?://(?:www\.)?swiggy\.com/city/[^\s"\'<>&]+rest\d+[^\s"\'<>&]*',
                             html,
@@ -183,11 +195,33 @@ async def extract_swiggy_link(place_id: str, restaurant_name: str = "", address:
                             result["swiggy_url"] = urllib.parse.unquote(swiggy_matches[0])
                             print(f"✅ Found Swiggy (Bing): {result['swiggy_url'][:100]}")
                             break
-                except Exception as e:
-                    print(f"   ⚠️ Bing error: {e}")
-                    continue
 
-    # ── Extract restaurant ID ──
+                        # Check links too
+                        links = await page.eval_on_selector_all(
+                            "a[href]",
+                            "els => els.map(e => e.href)",
+                        )
+                        for href in links:
+                            if "swiggy.com" in href and "rest" in href:
+                                clean = _clean_redirect(href)
+                                if "rest" in clean:
+                                    result["swiggy_url"] = clean
+                                    print(f"✅ Found Swiggy (Bing link): {clean[:100]}")
+                                    break
+
+                        if result["swiggy_url"]:
+                            break
+
+                    except Exception as e:
+                        print(f"   ⚠️ Bing error: {e}")
+                        continue
+
+        except Exception as e:
+            print(f"❌ Search error: {e}")
+
+        await browser.close()
+
+    # Extract restaurant ID
     if result["swiggy_url"]:
         match = re.search(r"rest(\d+)", result["swiggy_url"])
         if match:
@@ -225,3 +259,18 @@ def _extract_city(address: str) -> str:
         return cleaned[0]
 
     return ""
+
+
+def _clean_redirect(url: str) -> str:
+    """Extract actual URL from search engine redirect wrappers."""
+    # DuckDuckGo redirect
+    if "duckduckgo.com/l/" in url:
+        match = re.search(r'uddg=(https?[^&]+)', url)
+        if match:
+            return urllib.parse.unquote(match.group(1))
+    # Google redirect
+    if "google.com/url" in url:
+        match = re.search(r'[?&]q=(https?[^&]+)', url)
+        if match:
+            return urllib.parse.unquote(match.group(1))
+    return url
