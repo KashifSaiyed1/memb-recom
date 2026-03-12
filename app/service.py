@@ -18,16 +18,11 @@ async def process_restaurant(
     save_csv: bool = True,
     save_json: bool = True,
 ) -> dict:
-    """
-    OLD FLOW: Search Swiggy by name → parse → infer.
-    """
-    # ── Step 1: Scrape ──
+    """OLD FLOW: Search Swiggy by name → parse → infer."""
     menu_json = await fetch_menu(restaurant_name, lat=lat, lng=lng, city_label=city_label)
-
     if not menu_json:
         print("❌ Menu not captured.")
         return {"error": "Menu not captured"}
-
     return await _process_menu_json(menu_json, restaurant_name, save_csv, save_json)
 
 
@@ -40,23 +35,24 @@ async def process_restaurant_by_id(
     save_csv: bool = False,
     save_json: bool = False,
 ) -> dict:
-    """
-    NEW FLOW: Fetch menu directly by Swiggy restaurant ID (skips search).
-    """
-    # ── Step 1: Scrape by ID ──
+    """Fetch menu directly by Swiggy restaurant ID (skips search)."""
     menu_json = await fetch_menu_by_id(
-        restaurant_id=restaurant_id,
-        lat=lat,
-        lng=lng,
-        city_label=city_label,
-        swiggy_url=swiggy_url,
+        restaurant_id=restaurant_id, lat=lat, lng=lng,
+        city_label=city_label, swiggy_url=swiggy_url,
     )
-
     if not menu_json:
         print("❌ Menu not captured.")
         return {"error": "Menu not captured"}
-
     return await _process_menu_json(menu_json, f"rest{restaurant_id}", save_csv, save_json)
+
+
+async def process_menu_json(menu_json: dict) -> dict:
+    """
+    NEW: Process an already-fetched menu JSON.
+    Used by the optimized single-session flow where menu_json
+    is already captured in google_places.py.
+    """
+    return await _process_menu_json(menu_json, "restaurant", False, False)
 
 
 async def _process_menu_json(
@@ -65,15 +61,12 @@ async def _process_menu_json(
     save_csv: bool,
     save_json: bool,
 ) -> dict:
-    """
-    Shared processing: parse menu items → extract metadata → infer attributes.
-    Used by both old and new flow.
-    """
-    # ── Step 2: Extract restaurant metadata ──
+    """Shared processing: parse → extract metadata → infer attributes."""
+    # Extract restaurant metadata
     restaurant_info = extract_restaurant_info(menu_json)
     _print_restaurant_info(restaurant_info)
 
-    # ── Step 3: Parse menu items ──
+    # Parse menu items
     menu_items = parse_menu(menu_json)
 
     if not menu_items:
@@ -86,15 +79,15 @@ async def _process_menu_json(
             pass
         return {"error": "No menu items found"}
 
-    # ── Step 4: Infer business attributes ──
+    # Infer business attributes
     inferred = infer_restaurant_attributes(restaurant_info, menu_items)
 
-    # ── Step 5: Build DataFrame ──
+    # Build DataFrame
     df = pd.DataFrame(menu_items)
     for key, value in inferred.items():
         df[key] = value
 
-    # ── Step 6: Build summary ──
+    # Build summary
     summary = {
         "Restaurant Name": restaurant_info.get("name", label),
         "Cuisines (Swiggy)": ", ".join(restaurant_info.get("cuisines", [])),
@@ -108,14 +101,12 @@ async def _process_menu_json(
 
     _print_summary(summary)
 
-    # ── Step 7: Save files ──
+    # Save files
     base_name = _safe_filename(label)
-
     if save_csv:
         csv_path = f"{base_name}_menu.csv"
         df.to_csv(csv_path, index=False)
         print(f"\n💾 Menu saved as {csv_path} ({len(df)} items)")
-
     if save_json:
         json_path = f"{base_name}_summary.json"
         with open(json_path, "w") as f:
@@ -129,8 +120,6 @@ async def _process_menu_json(
         "summary": summary,
     }
 
-
-# ── Helpers ──
 
 def _safe_filename(name: str) -> str:
     return name.strip().replace(" ", "_").replace("/", "_")
